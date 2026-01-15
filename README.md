@@ -67,7 +67,7 @@
 
 ### 下载安装
 
-从 [Releases](https://github.com/YOUR_USERNAME/outlook-mail-manager/releases) 页面下载最新版本的 `邮箱管家.exe`，双击运行即可。
+从 [Releases](https://github.com/vag-Zhao/Outlook-Mail-Manager/releases) 页面下载最新版本的 `邮箱管家.exe`，双击运行即可。
 
 ### 从源码构建
 
@@ -86,8 +86,8 @@ go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
 ```bash
 # 克隆仓库
-git clone https://github.com/YOUR_USERNAME/outlook-mail-manager.git
-cd outlook-mail-manager
+git clone https://github.com/vag-Zhao/Outlook-Mail-Manager.git
+cd Outlook-Mail-Manager
 
 # 开发模式运行
 wails dev
