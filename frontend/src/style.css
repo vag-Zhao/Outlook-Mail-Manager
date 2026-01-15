@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #app { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+/* 强制HTML邮件内容使用深色文字 */
+.prose {
+  color: #1f2937 !important;
+}
+.prose * {
+  color: inherit !important;
+}
+.prose a {
+  color: #2563eb !important;
+}
+.prose img {
+  filter: none;
+  background: white;
+}

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "outlook-mail-manager",
+  "outputfilename": "邮箱管家",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "info": {
+    "companyName": "ZGS",
+    "productName": "邮箱管家",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright © 2026 ZGS"
+  },
+  "author": {
+    "name": "ZGS",
+    "email": "zgs430@gmail.com"
+  }
+}
