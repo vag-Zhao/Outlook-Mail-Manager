@@ -34,6 +34,7 @@ type Account struct {
 	GroupName      string     `json:"groupName,omitempty"`      // 分组名称（JOIN查询填充）
 	DisplayName    string     `json:"displayName,omitempty"`    // 显示名称
 	Status         string     `json:"status"`                   // 状态：active=正常, error=异常
+	Protocol       string     `json:"protocol"`                 // 协议类型：o2=REST API, imap=IMAP协议
 	LastError      string     `json:"lastError,omitempty"`      // 最后一次错误信息
 	CreatedAt      time.Time  `json:"createdAt"`                // 创建时间
 	UpdatedAt      time.Time  `json:"updatedAt"`                // 更新时间

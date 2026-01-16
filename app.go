@@ -12,10 +12,12 @@ package main
 
 import (
 	"context"
+	"log"
 	"os"
 	"outlook-mail-manager/internal/database"
 	"outlook-mail-manager/internal/models"
 	"outlook-mail-manager/internal/services"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -41,8 +43,10 @@ type App struct {
 	accountSvc *services.AccountService  // 账号服务：处理账号的CRUD操作
 	groupSvc   *services.GroupService    // 分组服务：处理分组的CRUD操作
 	graphSvc   *services.GraphService    // Graph服务：封装Microsoft Outlook API调用
+	imapSvc    *services.IMAPService     // IMAP服务：用于Hotmail等个人账户
 	tokenMu    sync.RWMutex              // Token缓存读写锁，保证并发安全
 	tokens     map[int64]*tokenCache     // Token缓存映射表，key为账号ID
+	imapTokens map[int64]*tokenCache     // IMAP Token缓存（使用不同scope）
 }
 
 // NewApp 创建应用实例
@@ -57,7 +61,9 @@ func NewApp() *App {
 		accountSvc: services.NewAccountService(), // 初始化账号服务
 		groupSvc:   services.NewGroupService(),   // 初始化分组服务
 		graphSvc:   services.NewGraphService(),   // 初始化Graph API服务
+		imapSvc:    services.NewIMAPService(),    // 初始化IMAP服务
 		tokens:     make(map[int64]*tokenCache),  // 初始化空的Token缓存
+		imapTokens: make(map[int64]*tokenCache),  // 初始化IMAP Token缓存
 	}
 }
 
@@ -251,121 +257,263 @@ func (a *App) ClearGroup(groupID int64) error {
 
 // GetMailFolders 获取邮箱文件夹列表
 //
-// 调用Microsoft Outlook API获取用户的邮件文件夹（收件箱、已发送、草稿等）
-// 如果Token过期（返回401），会自动刷新Token并重试一次
-//
-// 参数：
-//   - accountID: 账号ID
-//
-// 返回值：
-//   - []models.MailFolder: 文件夹列表，包含ID、名称、未读数等
-//   - error: API调用错误或Token刷新失败
+// 策略：已标记imap的直接用IMAP，否则先尝试REST API，失败后回退到IMAP并标记
 func (a *App) GetMailFolders(accountID int64) ([]models.MailFolder, error) {
-	// 获取有效的访问令牌
-	token, err := a.ensureValidToken(accountID)
+	log.Printf("[App] GetMailFolders 开始 - accountID: %d", accountID)
+
+	account, err := a.accountSvc.GetByID(accountID)
 	if err != nil {
+		log.Printf("[App] GetByID 失败: %v", err)
 		return nil, err
 	}
-	// 调用Graph API获取文件夹
-	result, err := a.graphSvc.GetMailFolders(token)
-	// Token过期时自动重试：清除缓存，强制刷新Token，重新请求
-	if err != nil && strings.Contains(err.Error(), "unauthorized") {
-		a.clearTokenCache(accountID)
-		token, err = a.getToken(accountID, true)
+	log.Printf("[App] 账号信息: email=%s, protocol=%s, status=%s", account.Email, account.Protocol, account.Status)
+
+	// 已标记为 IMAP 的账号直接使用 IMAP
+	if account.Protocol == "imap" {
+		log.Printf("[App] 账号已标记为 IMAP，直接使用 IMAP 协议")
+		imapToken, err := a.getIMAPToken(accountID, false)
 		if err != nil {
+			log.Printf("[App] getIMAPToken 失败: %v", err)
 			return nil, err
 		}
-		return a.graphSvc.GetMailFolders(token)
+		log.Printf("[App] IMAP Token 获取成功，调用 imapSvc.GetMailFolders")
+		return a.imapSvc.GetMailFolders(account.Email, imapToken)
+	}
+
+	// 先尝试 REST API
+	log.Printf("[App] 尝试 REST API (O2)...")
+	if token, err := a.ensureValidToken(accountID); err == nil {
+		log.Printf("[App] O2 Token 获取成功，调用 graphSvc.GetMailFolders")
+		if result, err := a.graphSvc.GetMailFolders(token); err == nil {
+			log.Printf("[App] O2 成功，返回 %d 个文件夹", len(result))
+			return result, nil
+		} else {
+			log.Printf("[App] O2 GetMailFolders 失败: %v", err)
+			if strings.Contains(err.Error(), "unauthorized") {
+				log.Printf("[App] Token 过期，清除缓存并重试...")
+				a.clearTokenCache(accountID)
+				if token, err = a.getToken(accountID, true); err == nil {
+					log.Printf("[App] 重新获取 Token 成功，再次调用 graphSvc.GetMailFolders")
+					if result, err := a.graphSvc.GetMailFolders(token); err == nil {
+						log.Printf("[App] O2 重试成功，返回 %d 个文件夹", len(result))
+						return result, nil
+					} else {
+						log.Printf("[App] O2 重试失败: %v", err)
+					}
+				} else {
+					log.Printf("[App] 重新获取 Token 失败: %v", err)
+				}
+			}
+		}
+	} else {
+		log.Printf("[App] ensureValidToken 失败: %v", err)
+	}
+
+	// REST API 失败，回退到 IMAP 并标记
+	log.Printf("[App] O2 失败，回退到 IMAP...")
+	imapToken, err := a.getIMAPToken(accountID, false)
+	if err != nil {
+		log.Printf("[App] getIMAPToken 失败: %v", err)
+		return nil, err
+	}
+	log.Printf("[App] IMAP Token 获取成功，调用 imapSvc.GetMailFolders")
+	result, err := a.imapSvc.GetMailFolders(account.Email, imapToken)
+	if err == nil {
+		log.Printf("[App] IMAP 成功，返回 %d 个文件夹，标记账号为 IMAP", len(result))
+		a.accountSvc.UpdateProtocol(accountID, "imap")
+		runtime.EventsEmit(a.ctx, "protocol-updated", accountID, "imap")
+	} else {
+		log.Printf("[App] IMAP 也失败: %v", err)
 	}
 	return result, err
 }
 
 // GetMessages 获取指定文件夹的邮件列表
 //
-// 支持分页加载，每页20条邮件，按接收时间倒序排列
-//
-// 参数：
-//   - accountID: 账号ID
-//   - folderID: 文件夹ID（如"inbox"、"junkemail"）
-//   - page: 页码，从0开始
-//
-// 返回值：
-//   - []models.Message: 邮件列表
-//   - error: API调用错误
+// 策略：已标记imap的直接用IMAP，否则先尝试REST API，失败后回退到IMAP并标记
 func (a *App) GetMessages(accountID int64, folderID string, page int) ([]models.Message, error) {
-	token, err := a.ensureValidToken(accountID)
+	log.Printf("[App] GetMessages 开始 - accountID: %d, folderID: %s, page: %d", accountID, folderID, page)
+
+	account, err := a.accountSvc.GetByID(accountID)
 	if err != nil {
+		log.Printf("[App] GetByID 失败: %v", err)
 		return nil, err
 	}
-	// 计算分页参数：skip = page * 20, top = 20
-	result, err := a.graphSvc.GetMessages(token, folderID, page*20, 20)
-	if err != nil && strings.Contains(err.Error(), "unauthorized") {
-		a.clearTokenCache(accountID)
-		token, err = a.getToken(accountID, true)
+	log.Printf("[App] 账号: email=%s, protocol=%s", account.Email, account.Protocol)
+
+	// 已标记为 IMAP 的账号直接使用 IMAP
+	if account.Protocol == "imap" {
+		log.Printf("[App] 账号已标记为 IMAP，直接使用 IMAP")
+		imapToken, err := a.getIMAPToken(accountID, false)
 		if err != nil {
+			log.Printf("[App] getIMAPToken 失败: %v", err)
 			return nil, err
 		}
-		return a.graphSvc.GetMessages(token, folderID, page*20, 20)
+		log.Printf("[App] 调用 imapSvc.GetMessages")
+		return a.imapSvc.GetMessages(account.Email, imapToken, folderID, page*20, 20)
+	}
+
+	// 先尝试 REST API
+	log.Printf("[App] 尝试 REST API (O2)...")
+	if token, err := a.ensureValidToken(accountID); err == nil {
+		log.Printf("[App] O2 Token 获取成功")
+		if result, err := a.graphSvc.GetMessages(token, folderID, page*20, 20); err == nil {
+			log.Printf("[App] O2 成功，返回 %d 封邮件", len(result))
+			return result, nil
+		} else {
+			log.Printf("[App] O2 GetMessages 失败: %v", err)
+			if strings.Contains(err.Error(), "unauthorized") {
+				log.Printf("[App] Token 过期，重试...")
+				a.clearTokenCache(accountID)
+				if token, err = a.getToken(accountID, true); err == nil {
+					if result, err := a.graphSvc.GetMessages(token, folderID, page*20, 20); err == nil {
+						log.Printf("[App] O2 重试成功")
+						return result, nil
+					}
+				}
+			}
+		}
+	} else {
+		log.Printf("[App] ensureValidToken 失败: %v", err)
+	}
+
+	// REST API 失败，回退到 IMAP 并标记
+	log.Printf("[App] O2 失败，回退到 IMAP...")
+	imapToken, err := a.getIMAPToken(accountID, false)
+	if err != nil {
+		log.Printf("[App] getIMAPToken 失败: %v", err)
+		return nil, err
+	}
+	result, err := a.imapSvc.GetMessages(account.Email, imapToken, folderID, page*20, 20)
+	if err == nil {
+		log.Printf("[App] IMAP 成功，返回 %d 封邮件，标记账号为 IMAP", len(result))
+		a.accountSvc.UpdateProtocol(accountID, "imap")
+		runtime.EventsEmit(a.ctx, "protocol-updated", accountID, "imap")
+	} else {
+		log.Printf("[App] IMAP 也失败: %v", err)
 	}
 	return result, err
 }
 
 // GetMessageDetail 获取邮件详情
 //
-// 获取邮件的完整内容，包括HTML正文
-// 支持Token过期自动重试
-//
-// 参数：
-//   - accountID: 账号ID
-//   - messageID: 邮件ID
-//
-// 返回值：
-//   - *models.Message: 邮件详情，包含完整正文
-//   - error: API调用错误
-func (a *App) GetMessageDetail(accountID int64, messageID string) (*models.Message, error) {
-	token, err := a.ensureValidToken(accountID)
+// 策略：已标记imap的直接用IMAP，否则先尝试REST API，失败后回退到IMAP并标记
+func (a *App) GetMessageDetail(accountID int64, messageID string, folderID string) (*models.Message, error) {
+	account, err := a.accountSvc.GetByID(accountID)
 	if err != nil {
 		return nil, err
 	}
-	result, err := a.graphSvc.GetMessage(token, messageID)
-	if err != nil && strings.Contains(err.Error(), "unauthorized") {
-		a.clearTokenCache(accountID)
-		token, err = a.getToken(accountID, true)
+
+	var msg *models.Message
+
+	// 已标记为 IMAP 的账号直接使用 IMAP
+	if account.Protocol == "imap" {
+		imapToken, err := a.getIMAPToken(accountID, false)
 		if err != nil {
 			return nil, err
 		}
-		return a.graphSvc.GetMessage(token, messageID)
+		if folderID == "" {
+			folderID = "inbox"
+		}
+		msg, err = a.imapSvc.GetMessage(account.Email, imapToken, folderID, messageID)
+		if err != nil {
+			return nil, err
+		}
+		goto sanitize
 	}
-	return result, err
+
+	// 先尝试 REST API
+	if token, err := a.ensureValidToken(accountID); err == nil {
+		if msg, err = a.graphSvc.GetMessage(token, messageID); err == nil {
+			goto sanitize
+		} else if strings.Contains(err.Error(), "unauthorized") {
+			a.clearTokenCache(accountID)
+			if token, err = a.getToken(accountID, true); err == nil {
+				if msg, err = a.graphSvc.GetMessage(token, messageID); err == nil {
+					goto sanitize
+				}
+			}
+		}
+	}
+
+	// REST API 失败，回退到 IMAP 并标记
+	{
+		imapToken, err := a.getIMAPToken(accountID, false)
+		if err != nil {
+			return nil, err
+		}
+		if folderID == "" {
+			folderID = "inbox"
+		}
+		msg, err = a.imapSvc.GetMessage(account.Email, imapToken, folderID, messageID)
+		if err != nil {
+			return nil, err
+		}
+		a.accountSvc.UpdateProtocol(accountID, "imap")
+		runtime.EventsEmit(a.ctx, "protocol-updated", accountID, "imap")
+	}
+
+sanitize:
+	// 统一清理HTML内容中的脚本
+	if msg != nil && msg.Body != nil && strings.ToLower(msg.Body.ContentType) == "html" {
+		msg.Body.Content = sanitizeHTML(msg.Body.Content)
+	}
+	return msg, nil
+}
+
+// sanitizeHTML 清理HTML中的所有脚本内容
+func sanitizeHTML(s string) string {
+	// 移除script标签及内容
+	s = regexp.MustCompile(`(?is)<script[\s\S]*?</script>`).ReplaceAllString(s, "")
+	// 移除未闭合的script标签
+	s = regexp.MustCompile(`(?i)<script[^>]*>`).ReplaceAllString(s, "")
+	// 移除noscript标签
+	s = regexp.MustCompile(`(?is)<noscript[\s\S]*?</noscript>`).ReplaceAllString(s, "")
+	// 移除iframe标签（可能包含脚本）
+	s = regexp.MustCompile(`(?is)<iframe[\s\S]*?</iframe>`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`(?i)<iframe[^>]*>`).ReplaceAllString(s, "")
+	// 移除所有on*事件属性
+	s = regexp.MustCompile(`(?i)\s+on\w+\s*=\s*["'][^"']*["']`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`(?i)\s+on\w+\s*=\s*[^\s>]+`).ReplaceAllString(s, "")
+	// 移除javascript: URL
+	s = regexp.MustCompile(`(?i)javascript:`).ReplaceAllString(s, "blocked:")
+	// 移除vbscript: URL
+	s = regexp.MustCompile(`(?i)vbscript:`).ReplaceAllString(s, "blocked:")
+	// 移除data: URL中的脚本
+	s = regexp.MustCompile(`(?i)data:\s*text/html`).ReplaceAllString(s, "blocked:")
+	return s
 }
 
 // GetAttachments 获取邮件附件列表
 //
-// 获取指定邮件的所有附件信息
-// 支持Token过期自动重试
-//
-// 参数：
-//   - accountID: 账号ID
-//   - messageID: 邮件ID
-//
-// 返回值：
-//   - []models.Attachment: 附件列表，包含文件名、大小、Base64内容
-//   - error: API调用错误
+// 策略：已标记imap的直接返回空，否则尝试REST API
 func (a *App) GetAttachments(accountID int64, messageID string) ([]models.Attachment, error) {
-	token, err := a.ensureValidToken(accountID)
+	account, err := a.accountSvc.GetByID(accountID)
 	if err != nil {
 		return nil, err
 	}
-	result, err := a.graphSvc.GetAttachments(token, messageID)
-	if err != nil && strings.Contains(err.Error(), "unauthorized") {
-		a.clearTokenCache(accountID)
-		token, err = a.getToken(accountID, true)
-		if err != nil {
-			return nil, err
-		}
-		return a.graphSvc.GetAttachments(token, messageID)
+
+	// 已标记为 IMAP 的账号，附件已在GetMessage中解析
+	if account.Protocol == "imap" {
+		return []models.Attachment{}, nil
 	}
-	return result, err
+
+	// 尝试 REST API
+	if token, err := a.ensureValidToken(accountID); err == nil {
+		if result, err := a.graphSvc.GetAttachments(token, messageID); err == nil {
+			return result, nil
+		} else if strings.Contains(err.Error(), "unauthorized") {
+			a.clearTokenCache(accountID)
+			if token, err = a.getToken(accountID, true); err == nil {
+				if result, err := a.graphSvc.GetAttachments(token, messageID); err == nil {
+					return result, nil
+				}
+			}
+		}
+	}
+
+	// REST API 失败，返回空（IMAP附件已在GetMessage中解析）
+	return []models.Attachment{}, nil
 }
 
 // ============================================================================
@@ -460,8 +608,63 @@ func (a *App) getToken(accountID int64, forceRefresh bool) (string, error) {
 //   - accountID: 要清除缓存的账号ID
 func (a *App) clearTokenCache(accountID int64) {
 	a.tokenMu.Lock()
-	delete(a.tokens, accountID) // 从map中删除缓存项
+	delete(a.tokens, accountID)     // 从map中删除缓存项
+	delete(a.imapTokens, accountID) // 同时清除IMAP缓存
 	a.tokenMu.Unlock()
+}
+
+// getIMAPToken 获取IMAP协议专用的访问令牌
+//
+// IMAP协议需要特定的scope权限，与REST API使用的Token不同。
+// 本方法实现了Token的缓存和自动刷新机制。
+//
+// 缓存策略：
+//  1. 检查内存缓存是否有有效Token（距过期时间>1分钟）
+//  2. 缓存命中则直接返回，避免重复刷新
+//  3. 缓存未命中则调用Microsoft OAuth2 API刷新Token
+//  4. 刷新成功后更新数据库和内存缓存
+//
+// 参数：
+//   - accountID: 账号ID，用于查找账号信息和缓存Token
+//   - forceRefresh: 是否强制刷新，true时跳过缓存检查
+//
+// 返回值：
+//   - string: 有效的IMAP访问令牌
+//   - error: 账号不存在或Token刷新失败时返回错误
+//
+// 注意：刷新失败时会将账号状态标记为"error"并记录错误信息
+func (a *App) getIMAPToken(accountID int64, forceRefresh bool) (string, error) {
+	if !forceRefresh {
+		a.tokenMu.RLock()
+		if cached, ok := a.imapTokens[accountID]; ok && cached.expiresAt.After(time.Now().Add(time.Minute)) {
+			a.tokenMu.RUnlock()
+			return cached.token, nil
+		}
+		a.tokenMu.RUnlock()
+	}
+
+	account, err := a.accountSvc.GetByID(accountID)
+	if err != nil {
+		return "", err
+	}
+
+	// 使用IMAP专用scope刷新Token
+	tokenResp, err := services.RefreshAccessTokenForIMAP(account.ClientID, account.RefreshToken)
+	if err != nil {
+		a.accountSvc.UpdateStatus(accountID, "error", err.Error())
+		return "", err
+	}
+
+	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	// 保存新的token和refresh token到数据库
+	a.accountSvc.UpdateToken(accountID, tokenResp.AccessToken, tokenResp.RefreshToken, expiresAt)
+	a.accountSvc.UpdateStatus(accountID, "active", "")
+
+	a.tokenMu.Lock()
+	a.imapTokens[accountID] = &tokenCache{token: tokenResp.AccessToken, expiresAt: expiresAt}
+	a.tokenMu.Unlock()
+
+	return tokenResp.AccessToken, nil
 }
 
 // ============================================================================

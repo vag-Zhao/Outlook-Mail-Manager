@@ -131,7 +131,14 @@ func migrate() error {
 	`
 	// 执行SQL语句
 	_, err := DB.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// 添加 protocol 列（如果不存在）
+	DB.Exec("ALTER TABLE accounts ADD COLUMN protocol TEXT DEFAULT 'o2'")
+
+	return nil
 }
 
 // Close 关闭数据库连接

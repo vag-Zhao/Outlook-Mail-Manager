@@ -37,36 +37,76 @@ type TokenResponse struct {
 	ErrorDesc    string `json:"error_description"`  // 错误描述（失败时）
 }
 
-// RefreshAccessToken 刷新访问令牌
+// OAuth2 Scope常量定义
 //
-// 使用RefreshToken向Microsoft OAuth2服务器请求新的AccessToken
-// 这是OAuth2标准的refresh_token授权类型
+// Scope定义了应用程序请求的权限范围
+// Microsoft Identity Platform使用scope来控制访问令牌的权限
+const (
+	// ScopeIMAP IMAP协议访问权限
+	//
+	// 包含两个权限：
+	// - IMAP.AccessAsUser.All: 允许以用户身份通过IMAP协议访问邮箱
+	// - offline_access: 允许获取refresh_token以便离线刷新访问令牌
+	//
+	// 注意：REST API不需要显式设置scope，使用原始token权限即可
+	ScopeIMAP = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+)
+
+// RefreshAccessToken 刷新访问令牌（REST API，不设置scope使用原始权限）
+func RefreshAccessToken(clientID, refreshToken string) (*TokenResponse, error) {
+	// 尝试consumers端点（个人账户）
+	token, err := refreshWithEndpoint(clientID, refreshToken, "", "consumers")
+	if err != nil && strings.Contains(err.Error(), "invalid_grant") {
+		// 回退到common端点（工作/学校账户）
+		return refreshWithEndpoint(clientID, refreshToken, "", "common")
+	}
+	return token, err
+}
+
+// RefreshAccessTokenForIMAP 刷新访问令牌（IMAP scope）
+func RefreshAccessTokenForIMAP(clientID, refreshToken string) (*TokenResponse, error) {
+	// 尝试consumers端点（个人账户）
+	token, err := refreshWithEndpoint(clientID, refreshToken, ScopeIMAP, "consumers")
+	if err != nil && strings.Contains(err.Error(), "invalid_grant") {
+		// 回退到common端点（工作/学校账户）
+		return refreshWithEndpoint(clientID, refreshToken, ScopeIMAP, "common")
+	}
+	return token, err
+}
+
+// refreshWithEndpoint 使用指定端点刷新访问令牌
 //
-// 请求参数：
-// - client_id: Azure应用注册的客户端ID
-// - grant_type: "refresh_token"（固定值）
-// - refresh_token: 之前获取的刷新令牌
-//
-// 注意：不设置scope参数，使用原始token的权限范围（outlook.office.com）
+// 这是Token刷新的核心实现函数，向Microsoft Identity Platform发送刷新请求。
+// 支持不同的租户端点以适配个人账户和工作/学校账户。
 //
 // 参数：
-//   - clientID: OAuth2客户端ID（Azure应用注册）
-//   - refreshToken: 刷新令牌
+//   - clientID: OAuth2应用程序的客户端ID（在Azure AD中注册）
+//   - refreshToken: 用于获取新访问令牌的刷新令牌
+//   - scope: 请求的权限范围（IMAP需要设置，REST API传空字符串）
+//   - tenant: 租户标识符，可选值：
+//     - "consumers": 个人Microsoft账户（Hotmail、Outlook.com等）
+//     - "common": 工作/学校账户（Office 365）
 //
 // 返回值：
-//   - *TokenResponse: 包含新AccessToken的响应
-//   - error: 请求失败或Token无效时返回错误
-func RefreshAccessToken(clientID, refreshToken string) (*TokenResponse, error) {
-	// Microsoft Identity Platform v2.0 令牌端点
-	// "common"表示支持任何Microsoft账户（个人/工作/学校）
-	endpoint := "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+//   - *TokenResponse: 包含新访问令牌的响应结构
+//   - error: 请求失败、解析失败或Token无效时返回错误
+//
+// 请求格式：
+//
+//	POST https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token
+//	Content-Type: application/x-www-form-urlencoded
+//	Body: client_id=xxx&grant_type=refresh_token&refresh_token=xxx&scope=xxx
+func refreshWithEndpoint(clientID, refreshToken, scope, tenant string) (*TokenResponse, error) {
+	endpoint := "https://login.microsoftonline.com/" + tenant + "/oauth2/v2.0/token"
 
-	// 构建表单数据
 	data := url.Values{}
-	data.Set("client_id", clientID)           // 客户端ID
-	data.Set("grant_type", "refresh_token")   // 授权类型：刷新令牌
-	data.Set("refresh_token", refreshToken)   // 刷新令牌
-	// 不设置scope，使用原始token的权限（outlook.office.com）
+	data.Set("client_id", clientID)
+	data.Set("grant_type", "refresh_token")
+	data.Set("refresh_token", refreshToken)
+	// 只有IMAP需要设置scope，REST API使用原始token权限
+	if scope != "" {
+		data.Set("scope", scope)
+	}
 
 	// 发送POST请求，Content-Type为application/x-www-form-urlencoded
 	resp, err := http.Post(endpoint, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))

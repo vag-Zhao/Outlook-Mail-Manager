@@ -81,11 +81,18 @@ const stats = computed(() => {
  */
 const emailHtmlContent = computed(() => {
   if (!mailStore.currentMessage?.body?.content) return ''
+  // 彻底清理所有可执行脚本内容
+  let clean = mailStore.currentMessage.body.content
+    .replace(/<script[\s\S]*?<\/script>/gi, '')  // script标签
+    .replace(/<script[^>]*>/gi, '')               // 未闭合的script
+    .replace(/\son\w+\s*=\s*["'][^"']*["']/gi, '') // onclick等事件
+    .replace(/\son\w+\s*=\s*[^\s>]+/gi, '')       // 无引号的事件
+    .replace(/javascript:/gi, 'blocked:')         // javascript: URL
   // 深色模式样式：反转颜色，图片二次反转保持原色
   const darkStyles = darkMode.value
     ? 'html{filter:invert(1) hue-rotate(180deg);}img{filter:invert(1) hue-rotate(180deg);}'
     : ''
-  return `<html><head><meta charset="utf-8"><style>${darkStyles}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:16px;padding:0;font-size:14px;line-height:1.6;}img{max-width:100%;}a{color:#3b82f6;}::-webkit-scrollbar{display:none;}body{-ms-overflow-style:none;scrollbar-width:none;}</style></head><body>${mailStore.currentMessage.body.content}</body></html>`
+  return `<html><head><meta charset="utf-8"><style>${darkStyles}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:16px;padding:0;font-size:14px;line-height:1.6;}img{max-width:100%;}a{color:#3b82f6;}::-webkit-scrollbar{display:none;}body{-ms-overflow-style:none;scrollbar-width:none;}</style></head><body>${clean}</body></html>`
 })
 
 // ============================================================================
@@ -253,8 +260,24 @@ function hideContextMenu() {
  * @param groupId - 目标分组ID
  */
 async function moveToGroup(accountId: number, groupId: number) {
+  console.log(`[App.vue] moveToGroup: accountId=${accountId}, groupId=${groupId}`)
   await accountStore.moveToGroup(accountId, groupId)
   hideContextMenu()
+}
+
+/**
+ * 刷新账号邮件（清除缓存并重新加载）
+ * @param accountId - 账号ID
+ */
+async function refreshAccount(accountId: number) {
+  console.log(`[App.vue] refreshAccount: accountId=${accountId}`)
+  hideContextMenu()
+  mailStore.clearAccountCache(accountId)
+  if (accountStore.selectedAccountId === accountId) {
+    await mailStore.loadFolders(accountId, true)
+    await mailStore.loadMessages(accountId, mailStore.selectedFolderId || 'inbox', 0, true)
+  }
+  showToast('已刷新', 'success')
 }
 
 /**
@@ -276,15 +299,26 @@ function copyAccountEmail(accountId: number) {
  * @param id - 分组ID
  */
 async function deleteGroup(id: number) {
+  console.log(`[App.vue] deleteGroup: id=${id}`)
   const group = accountStore.groups.find(g => g.id === id)
   const isDefault = group?.name === '默认分组'
   const message = isDefault ? '确定清空默认分组中的所有账号？' : '确定删除此分组？'
 
   showConfirm(message, async () => {
+    // 检查当前选中的账号是否在该分组中
+    const selectedAcc = accountStore.accounts.find(a => a.id === accountStore.selectedAccountId)
+    const needReset = selectedAcc && selectedAcc.groupId === id
+
     if (isDefault) {
       await accountStore.clearGroup(id)  // 清空默认分组
     } else {
       await accountStore.deleteGroup(id)  // 删除其他分组
+    }
+
+    // 如果当前选中的账号被删除，重置状态
+    if (needReset) {
+      accountStore.selectedAccountId = null
+      mailStore.reset()
     }
   })
   hideContextMenu()
@@ -301,6 +335,13 @@ async function deleteGroup(id: number) {
  * 3. 加载账号列表
  */
 onMounted(async () => {
+  // 监听协议更新事件，实时更新账号协议标签
+  // @ts-ignore
+  window.runtime?.EventsOn('protocol-updated', (accountID: number, protocol: string) => {
+    const acc = accountStore.accounts.find(a => a.id === accountID)
+    if (acc) acc.protocol = protocol
+  })
+
   await accountStore.loadGroups()
   // 默认选中"默认分组"
   const defaultGroup = accountStore.groups.find(g => g.name === '默认分组')
@@ -316,10 +357,11 @@ onMounted(async () => {
  */
 watch(() => accountStore.selectedAccountId, async (id) => {
   if (id) {
-    mailStore.reset()  // 重置邮件状态
-    await mailStore.loadFolders(id)  // 加载文件夹
-    // 刷新账号列表以更新状态（Token可能已刷新）
-    await accountStore.loadAccounts()
+    const success = await mailStore.loadFolders(id)
+    // 如果请求被中断或账号已切换，不继续加载邮件
+    if (!success || accountStore.selectedAccountId !== id) return
+    mailStore.selectedFolderId = 'inbox'
+    await mailStore.loadMessages(id, 'inbox', 0)
   }
 })
 
@@ -333,6 +375,7 @@ watch(() => accountStore.selectedAccountId, async (id) => {
  */
 async function handleImport() {
   if (!importText.value.trim()) return
+  console.log(`[App.vue] handleImport: 开始导入`)
   importLoading.value = true
   try {
     const count = await accountStore.importAccounts(importText.value)
@@ -351,6 +394,7 @@ async function handleImport() {
  * @param folderId - 文件夹ID
  */
 async function selectFolder(folderId: string) {
+  console.log(`[App.vue] selectFolder: folderId=${folderId}`)
   mailStore.selectedFolderId = folderId
   if (accountStore.selectedAccountId) {
     await mailStore.loadMessages(accountStore.selectedAccountId, folderId, 0)
@@ -362,6 +406,7 @@ async function selectFolder(folderId: string) {
  * @param messageId - 邮件ID
  */
 async function selectMessage(messageId: string) {
+  console.log(`[App.vue] selectMessage: messageId=${messageId}`)
   if (accountStore.selectedAccountId) {
     await mailStore.loadMessageDetail(accountStore.selectedAccountId, messageId)
   }
@@ -381,6 +426,7 @@ async function loadMore() {
  */
 async function createGroup() {
   if (!newGroupName.value.trim()) return
+  console.log(`[App.vue] createGroup: name=${newGroupName.value}`)
   await accountStore.createGroup(newGroupName.value)
   newGroupName.value = ''
   showNewGroup.value = false
@@ -391,6 +437,7 @@ async function createGroup() {
  * @param id - 账号ID
  */
 async function deleteAccount(id: number) {
+  console.log(`[App.vue] deleteAccount: id=${id}`)
   showConfirm('确定删除此账号？', async () => {
     await accountStore.deleteAccount(id)
   })
@@ -413,6 +460,7 @@ function toggleSold(id: number) {
  */
 async function batchDelete() {
   if (selectedIds.value.size === 0) return
+  console.log(`[App.vue] batchDelete: count=${selectedIds.value.size}`)
   showConfirm(`确定删除选中的 ${selectedIds.value.size} 个账号？`, async () => {
     await (window as any).go.main.App.DeleteAccounts(Array.from(selectedIds.value))
     selectedIds.value.clear()
@@ -428,6 +476,7 @@ async function batchDelete() {
  */
 async function batchMoveToGroup(groupId: number) {
   if (selectedIds.value.size === 0) return
+  console.log(`[App.vue] batchMoveToGroup: count=${selectedIds.value.size}, groupId=${groupId}`)
   await (window as any).go.main.App.MoveAccountsToGroup(Array.from(selectedIds.value), groupId)
   selectedIds.value.clear()
   await accountStore.loadAccounts()
@@ -457,6 +506,7 @@ const checkProgress = ref({ current: 0, total: 0 })  // 检测进度
 async function batchCheckTokens() {
   const accounts = accountStore.filteredAccounts
   if (accounts.length === 0) return
+  console.log(`[App.vue] batchCheckTokens: count=${accounts.length}`)
   checkingTokens.value = true
   checkProgress.value = { current: 0, total: accounts.length }
   let success = 0, fail = 0
@@ -505,6 +555,7 @@ function copyText(text: string, tip: string, accId?: number) {
  * 格式：邮箱,密码（每行一个）
  */
 async function exportAccounts() {
+  console.log(`[App.vue] exportAccounts: count=${accountStore.filteredAccounts.length}`)
   const lines = accountStore.filteredAccounts.map(acc => `${acc.email},${generatePassword(acc.email)}`)
   const text = lines.join('\n')
   const result = await (window as any).go.main.App.SaveFile(text)
@@ -608,7 +659,7 @@ function downloadAttachment(att: any) {
           <div class="flex-1 min-w-0">
             <div class="truncate">{{ acc.email }}</div>
             <div :class="['text-xs', accountStore.selectedAccountId === acc.id ? 'text-blue-100' : 'text-gray-400']">
-              {{ acc.status === 'active' ? '✓ 正常' : '✗ 异常' }}
+              {{ acc.protocol === 'imap' ? '📧 IMAP' : '☁️ O2' }}
             </div>
           </div>
           <button @click.stop="deleteAccount(acc.id)"
@@ -637,8 +688,8 @@ function downloadAttachment(att: any) {
             !accountStore.selectedAccountId ? 'opacity-50' : '']">
           <ChevronRight class="w-3 h-3" />
           <span class="flex-1">{{ f.displayName }}</span>
-          <span v-if="f.unreadItemCount" class="px-1.5 py-0.5 bg-blue-500 text-white text-xs rounded-full">
-            {{ f.unreadItemCount }}
+          <span v-if="f.unreadItemCount || f.totalItemCount" class="px-1.5 py-0.5 bg-blue-500 text-white text-xs rounded-full">
+            {{ f.totalItemCount || f.unreadItemCount }}
           </span>
         </div>
       </div>
@@ -677,7 +728,14 @@ function downloadAttachment(att: any) {
 
     <!-- 右侧：邮件内容 - 仅邮件视图 -->
     <main v-if="currentView === 'mail'" :class="['flex-1 flex flex-col overflow-hidden', darkMode ? 'bg-gray-900 text-gray-200' : 'bg-white']">
-      <template v-if="mailStore.currentMessage">
+      <!-- 邮件详情加载中 -->
+      <div v-if="mailStore.detailLoading" class="h-full flex items-center justify-center">
+        <div class="flex flex-col items-center gap-3">
+          <div class="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+          <span :class="['text-sm', darkMode ? 'text-gray-400' : 'text-gray-500']">加载中...</span>
+        </div>
+      </div>
+      <template v-else-if="mailStore.currentMessage">
         <div :class="['p-4 border-b shrink-0', darkMode ? 'border-gray-700' : '']">
           <div class="flex items-center justify-between mb-3">
             <h2 class="text-xl font-semibold flex-1">{{ mailStore.currentMessage.subject || '(无主题)' }}</h2>
@@ -831,7 +889,10 @@ function downloadAttachment(att: any) {
               :style="{ width: (checkProgress.total ? (checkProgress.current / checkProgress.total * 100) : 0) + '%' }"></div>
           </div>
         </div>
-        <span v-if="mailStore.loading" class="text-blue-500">加载中...</span>
+        <span v-if="mailStore.loading" class="text-blue-500 flex items-center gap-1.5">
+          <span class="w-3.5 h-3.5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></span>
+          加载中...
+        </span>
         <button @click="darkMode = !darkMode"
           :class="['flex items-center gap-1.5 px-2 py-0.5 rounded transition-colors', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
           <span v-if="darkMode">☀️ 浅色</span>
@@ -866,14 +927,17 @@ function downloadAttachment(att: any) {
       <div :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
         :class="['absolute border rounded shadow-lg py-1 min-w-[120px]', darkMode ? 'bg-gray-800 border-gray-700 text-gray-200' : 'bg-white']" @click.stop>
         <template v-if="contextMenu.type === 'group'">
-          <button @click="exportGroupAccounts(contextMenu.id)" class="w-full px-3 py-1.5 text-left text-sm hover:bg-gray-100">
+          <button @click="exportGroupAccounts(contextMenu.id)" :class="['w-full px-3 py-1.5 text-left text-sm', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
             导出分组
           </button>
-          <button @click="deleteGroup(contextMenu.id)" class="w-full px-3 py-1.5 text-left text-sm hover:bg-gray-100 text-red-500">
+          <button @click="deleteGroup(contextMenu.id)" :class="['w-full px-3 py-1.5 text-left text-sm text-red-500', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
             删除分组
           </button>
         </template>
         <template v-else>
+          <button @click="refreshAccount(contextMenu.id)" :class="['w-full px-3 py-1.5 text-left text-sm', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
+            刷新邮件
+          </button>
           <button @click="copyAccountEmail(contextMenu.id)" :class="['w-full px-3 py-1.5 text-left text-sm', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
             复制邮箱
           </button>

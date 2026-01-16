@@ -47,7 +47,7 @@ func (s *AccountService) List(groupID *int64) ([]models.Account, error) {
 	// COALESCE处理NULL值，提供默认值
 	query := `SELECT a.id, a.email, COALESCE(a.password,''), a.client_id, COALESCE(a.refresh_token,''), COALESCE(a.access_token,''),
 		a.token_expires_at, a.group_id, COALESCE(g.name, '默认分组'), COALESCE(a.display_name,''), COALESCE(a.status,'active'),
-		COALESCE(a.last_error,''), a.created_at, a.updated_at
+		COALESCE(a.protocol,'o2'), COALESCE(a.last_error,''), a.created_at, a.updated_at
 		FROM accounts a LEFT JOIN groups g ON a.group_id = g.id`
 	args := []interface{}{}
 	// 可选的分组筛选条件
@@ -71,7 +71,7 @@ func (s *AccountService) List(groupID *int64) ([]models.Account, error) {
 		var grpID sql.NullInt64       // 分组ID可能为NULL
 		var createdAt, updatedAt sql.NullString
 		err := rows.Scan(&a.ID, &a.Email, &a.Password, &a.ClientID, &a.RefreshToken, &a.AccessToken,
-			&tokenExp, &grpID, &a.GroupName, &a.DisplayName, &a.Status, &a.LastError, &createdAt, &updatedAt)
+			&tokenExp, &grpID, &a.GroupName, &a.DisplayName, &a.Status, &a.Protocol, &a.LastError, &createdAt, &updatedAt)
 		if err != nil {
 			continue // 跳过解析失败的行
 		}
@@ -98,12 +98,12 @@ func (s *AccountService) List(groupID *int64) ([]models.Account, error) {
 func (s *AccountService) GetByID(id int64) (*models.Account, error) {
 	var a models.Account
 	// 使用sql.NullXxx类型处理可空字段
-	var tokenExp, displayName, lastErr, accessToken sql.NullString
+	var tokenExp, displayName, lastErr, accessToken, protocol sql.NullString
 	var grpID sql.NullInt64
 	err := database.DB.QueryRow(`SELECT id, email, COALESCE(password,''), client_id, COALESCE(refresh_token,''), access_token,
-		token_expires_at, group_id, display_name, COALESCE(status,'active'), last_error FROM accounts WHERE id = ?`, id).
+		token_expires_at, group_id, display_name, COALESCE(status,'active'), protocol, last_error FROM accounts WHERE id = ?`, id).
 		Scan(&a.ID, &a.Email, &a.Password, &a.ClientID, &a.RefreshToken, &accessToken,
-			&tokenExp, &grpID, &displayName, &a.Status, &lastErr)
+			&tokenExp, &grpID, &displayName, &a.Status, &protocol, &lastErr)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +116,9 @@ func (s *AccountService) GetByID(id int64) (*models.Account, error) {
 	}
 	if accessToken.Valid {
 		a.AccessToken = accessToken.String
+	}
+	if protocol.Valid {
+		a.Protocol = protocol.String
 	}
 	// 解析Token过期时间（RFC3339格式）
 	if tokenExp.Valid {
@@ -264,5 +267,23 @@ func (s *AccountService) Count() int {
 //   - error: 删除失败时返回错误
 func (s *AccountService) DeleteByGroup(groupID int64) error {
 	_, err := database.DB.Exec("DELETE FROM accounts WHERE group_id = ?", groupID)
+	return err
+}
+
+// UpdateProtocol 更新账号的邮件访问协议类型
+//
+// 当REST API访问失败并成功回退到IMAP协议时，调用此方法将账号标记为IMAP类型。
+// 后续访问该账号时将直接使用IMAP协议，避免重复尝试REST API。
+//
+// 参数：
+//   - id: 账号ID
+//   - protocol: 协议类型，可选值：
+//     - "o2": Outlook REST API（默认）
+//     - "imap": IMAP协议（用于Hotmail等个人账户）
+//
+// 返回值：
+//   - error: 数据库更新失败时返回错误
+func (s *AccountService) UpdateProtocol(id int64, protocol string) error {
+	_, err := database.DB.Exec("UPDATE accounts SET protocol = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", protocol, id)
 	return err
 }
